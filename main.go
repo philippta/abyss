@@ -1,9 +1,14 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
+	"strconv"
 	"strings"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -19,6 +24,14 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
+
+	cmd := exec.Command("dlv", "--headless", "exec", "helloworld", "-l", "127.0.0.1:4111")
+	cmd.Dir = "/Users/philipp/code/hellworld"
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.Start()
+
+	time.Sleep(time.Second)
 
 	c := rpc2.NewClient("127.0.0.1:4111")
 	c.CreateBreakpoint(&api.Breakpoint{FunctionName: "main.main"})
@@ -41,6 +54,12 @@ func main() {
 type model struct {
 	dbg           *rpc2.RPCClient
 	width, height int
+
+	registers     api.Registers
+	prevRegisters api.Registers
+	prevStack     []byte
+	stack         []byte
+	stackaddr     uint64
 }
 
 func (m model) Init() tea.Cmd {
@@ -50,80 +69,184 @@ func (m model) Init() tea.Cmd {
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
-		fmt.Fprintln(debuglog, msg.String())
 		switch msg.String() {
 		case "ctrl+c", "q":
 			return m, tea.Quit
-		case "enter":
+		case "s":
+			stepInstruction(m.dbg)
+		case "i":
 			m.dbg.StepInstruction(false)
-			return m, nil
+		case "o":
+			m.dbg.StepOut()
 		}
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
 	}
+
+	var err error
+	state, err := m.dbg.GetState()
+	must(err)
+
+	m.prevRegisters = m.registers
+	m.registers, err = m.dbg.ListScopeRegisters(api.EvalScope{GoroutineID: state.CurrentThread.GoroutineID}, false)
+	must(err)
+
+	stackaddr, err := strconv.ParseUint(m.registers[1].Value[2:], 16, 64)
+	must(err)
+
+	m.stackaddr = stackaddr
+	m.prevStack = m.stack
+	m.stack, _, err = m.dbg.ExamineMemory(stackaddr, 256)
+	must(err)
 
 	return m, nil
 }
 
 func (m model) View() string {
 	asm := lipgloss.NewStyle().
-		BorderStyle(lipgloss.NormalBorder()).
-		BorderRight(true).
-		BorderBottom(true).
 		Width(m.width / 2).
-		Height(m.height - 15)
+		Height(m.height)
 
 	paneRegisters := lipgloss.NewStyle().
-		BorderStyle(lipgloss.NormalBorder()).
-		BorderBottom(true).
-		Width(m.width / 2).
-		Height(m.height - 15)
+		Width(m.width / 4).
+		Height(m.height)
 
-	mem := lipgloss.NewStyle().
-		BorderStyle(lipgloss.NormalBorder()).
-		BorderRight(true).
-		Width(m.width / 2).
-		Height(15)
+	// mem := lipgloss.NewStyle().
+	// 	BorderStyle(lipgloss.NormalBorder()).
+	// 	BorderRight(true).
+	// 	Width(m.width / 2).
+	// 	Height(15)
 
-	return lipgloss.JoinVertical(
+	return lipgloss.JoinHorizontal(
 		lipgloss.Top,
-		lipgloss.JoinHorizontal(
-			lipgloss.Top,
-			asm.Render(disassembly(m.dbg)),
-			paneRegisters.Render(registers(m.dbg)),
-		),
-		lipgloss.JoinHorizontal(
-			lipgloss.Top,
-			mem.Render(dummytext["stack"]),
-		),
+		asm.Render(disassembly(m.dbg, m.height)),
+		paneRegisters.Render(registers(m.registers, m.prevRegisters)),
+		paneRegisters.Render(stack(m.stackaddr, m.stack, m.prevStack)),
 	)
+	// lipgloss.JoinHorizontal(
+	// 	lipgloss.Top,
+	// 	mem.Render(dummytext["stack"]),
+	// ),
 }
 
-func disassembly(c *rpc2.RPCClient) string {
+func stepInstruction(c *rpc2.RPCClient) {
 	state, err := c.GetState()
 	must(err)
 
 	asms, err := c.DisassemblePC(api.EvalScope{GoroutineID: state.CurrentThread.GoroutineID}, state.CurrentThread.PC, api.IntelFlavour)
 	must(err)
 
-	var sb strings.Builder
+	var isCall bool
 	for _, asm := range asms {
-		fmt.Fprintf(&sb, "%X %-30s\n", asm.Loc.PC, lipgloss.NewStyle().Bold(asm.AtPC).Render(asm.Text))
+		if asm.AtPC {
+			if strings.HasPrefix(asm.Text, "CALL ") {
+				isCall = true
+			}
+			break
+		}
 	}
 
+	_, err = c.StepInstruction(false)
+	must(err)
+
+	if isCall {
+		_, err := c.StepOut()
+		must(err)
+	}
+}
+
+func stack(stackaddr uint64, stack, prevStack []byte) string {
+	style := lipgloss.NewStyle().Foreground(lipgloss.Color("4")).Bold(true)
+	var sb strings.Builder
+	sb.WriteString(style.Render("Stack") + "\n")
+	var buf [8]byte
+	var prevbuf [8]byte
+	for i, b := range stack {
+		if i%8 == 0 {
+			sb.WriteString(fmt.Sprintf("%X    ", stackaddr+uint64(i)))
+		}
+
+		buf[7-i%8] = b
+
+		if len(prevStack) > 0 {
+			prevbuf[7-i%8] = prevStack[i]
+		}
+		if i%8 == 7 {
+			if bytes.Equal(buf[:], prevbuf[:]) {
+				sb.WriteString(fmt.Sprintf("%02X", buf))
+			} else {
+				sb.WriteString(style.Render(fmt.Sprintf("%02X", buf)))
+			}
+			sb.WriteByte('\n')
+		}
+	}
 	return sb.String()
 }
 
-func registers(c *rpc2.RPCClient) string {
+func disassembly(c *rpc2.RPCClient, maxlines int) string {
 	state, err := c.GetState()
 	must(err)
 
-	regs, err := c.ListScopeRegisters(api.EvalScope{GoroutineID: state.CurrentThread.GoroutineID}, false)
+	asms, err := c.DisassembleRange(
+		api.EvalScope{GoroutineID: state.CurrentThread.GoroutineID},
+		state.CurrentThread.PC-(4*(uint64(maxlines)/2)),
+		state.CurrentThread.PC+(4*(uint64(maxlines)/2)),
+		api.IntelFlavour)
 	must(err)
 
+	var lines []string
+	var prevFunctionName string
+	for _, asm := range asms {
+		if asm.Loc.Function != nil && (prevFunctionName == "" || asm.Loc.Function.Name() != prevFunctionName) {
+			lines = append(lines, "")
+			lines = append(lines, fmt.Sprintf("%s", lipgloss.NewStyle().Foreground(lipgloss.Color("4")).Bold(true).Render(asm.Loc.Function.Name())))
+			prevFunctionName = asm.Loc.Function.Name()
+		}
+		var opcodes strings.Builder
+		for i := len(asm.Bytes) - 1; i >= 0; i-- {
+			opcodes.WriteString(fmt.Sprintf("%02X ", asm.Bytes[i]))
+		}
+		if asm.Text == "?" {
+			asm.Text = ""
+		}
+
+		style := lipgloss.NewStyle()
+		if asm.AtPC {
+			style = style.Foreground(lipgloss.Color("4")).Bold(true)
+		}
+		lines = append(lines, fmt.Sprintf("%-16X %-18s %-30s", asm.Loc.PC, opcodes.String(), style.Render(reformatasm(asm.Text))))
+	}
+	if len(lines) > 0 && lines[0] == "" {
+		lines = lines[1:]
+	}
+	if len(lines) > maxlines {
+		lines = lines[:maxlines]
+	}
+
+	return strings.Join(lines, "\n")
+}
+
+func reformatasm(s string) string {
+	segs := strings.SplitN(s, " ", 2)
+	if len(segs) == 1 {
+		return segs[0]
+	}
+	return fmt.Sprintf("%-6s %s", segs[0], segs[1])
+
+}
+
+func registers(registers, prevRegisters api.Registers) string {
 	var sb strings.Builder
-	for _, reg := range regs {
-		fmt.Fprintf(&sb, "%3s %s\n", reg.Name, strings.ToUpper(reg.Value)[2:])
+	sb.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("4")).Bold(true).Render("Registers") + "\n")
+	for i, reg := range registers {
+		style := lipgloss.NewStyle()
+		if len(prevRegisters) != 0 && prevRegisters[i].Name == reg.Name && prevRegisters[i].Value != reg.Value {
+			style = style.Foreground(lipgloss.Color("4")).Bold(true)
+		}
+
+		s := fmt.Sprintf("%3s %s", reg.Name, strings.ToUpper(reg.Value)[2:])
+		sb.WriteString(style.Render(s))
+		sb.WriteByte('\n')
 	}
 
 	return sb.String()
@@ -218,4 +341,9 @@ func must(err error) {
 		fmt.Fprintln(debuglog, err)
 		panic(err)
 	}
+}
+
+func dump(v any) {
+	b, _ := json.MarshalIndent(v, "", "  ")
+	os.Stdout.Write(b)
 }
